@@ -4,7 +4,6 @@
 #include <Seeed_Arduino_FS.h>
 #include "DateTime.h"
 #include <WiFi.h>
-#include <WebServer.h>
 #include <TFT_eSPI.h> 
 
 #ifdef _SAMD21_
@@ -12,9 +11,22 @@
 #define SDCARD_SPI SPI
 #endif
 
+// Generally Useful
+const unsigned int FIVE_SECONDS = 5000;
+
+/*****************************************/
+/* Replace with your network credentials */
+/*****************************************/
+const char* ssid = "";
+const char* password = "";
+
+
+/****************************************/
+/*        NTP and RTC sync setup        */
+/****************************************/
+
 unsigned int localPort = 2390;
 
-// used for clock sync
 // #define USELOCALNTP
 #ifdef USELOCALNTP
     char timeServer[] = "n.n.n.n";
@@ -26,17 +38,12 @@ byte packetBuffer[NTP_PACKET_SIZE];
 WiFiUDP udp;
 unsigned long deviceTime;
 
-// RTC (Real Time Clock)
+
 RTC_SAMD51 rtc;
 
-// Replace with your network credentials
-const char* ssid = "";
-const char* password = "";
-
-const int FIVE_SECONDS = 5000;
-
-// Web server on port 80
-WebServer server(80);
+/****************************************/ 
+/*          Other Device Setup          */
+/****************************************/
 
 // SHT40 instance
 Adafruit_SHT4x sht4;
@@ -47,26 +54,55 @@ Adafruit_SHT4x sht4;
 // TFT Screen instance
 TFT_eSPI tft = TFT_eSPI();
 
-// timestamp for for log file name
+
+/****************************************/ 
+/*       Application Shared State       */
+/****************************************/
+
+// track the time of the latest sample
+DateTime eventStamp;
+
+// timestamp for for log file names
 DateTime lastLog;
 
 // convenience for tracking the next line of text on the tft
 int line_y = 0;
 
-int nextLine() {
-  line_y += 15;
-  return line_y;
-}
-
+// Most text start at x = 10
 const int DEFAULT_LEFT_ALIGN = 10;
 
+/****************************************/
+/*           Utility Functions          */
+/****************************************/
+
+// stop on failures
+void fail(const char* message) {
+  displayMessageLeftAlign(message);
+  while (1) delay(10);
+}
+
+// Display text
+void displayMessage(const char* message, int x, int y) {
+  Serial.println(message);
+  tft.drawString(message, x, y);
+}
+
+// Display text left aligned
 void displayMessageLeftAlign(const  char* message) {
   displayMessage(message, DEFAULT_LEFT_ALIGN, nextLine());
 }
 
-void displayMessage(const char* message, int x, int y) {
-  Serial.println(message);
-  tft.drawString(message, x, y);
+unsigned int nextLine() {
+  line_y += 15;
+  return line_y;
+}
+
+void displayData(float temperature, float humidity) {
+    // TODO: see if this can be removed to eliminate flicker
+  tft.fillScreen(TFT_BLACK); // Clear the screen
+  tft.setTextSize(2);
+  tft.drawString("Temperature: " + String(temperature, 2) + " C", 10, 20);
+  tft.drawString("Humidity:    " + String(humidity, 2) + " %", 10, 50);
 }
 
 String getFileName() {
@@ -103,121 +139,45 @@ String toPageDate(DateTime dt) {
 
 }
 
-void setup() {
-  Serial.begin(115200);
+/****************************************/
+/* Application Initialization Functions */
+/****************************************/
 
-  // Initialize the screen
+void initializeScreen() {
   tft.begin();
-  tft.setRotation(3); // Rotate for horizontal orientation
-  tft.fillScreen(TFT_BLACK); // Clear the screen
-  tft.setTextColor(TFT_WHITE, TFT_BLACK); // White text on black background
+  tft.setRotation(3);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
-  displayMessageLeftAlign("Initializing...");
-  
-  // Initialize I2C and SHT40
-  if (!sht4.begin()) {
-    displayMessageLeftAlign("Error: SHT40 not found");
-    while (1);
-  }
-  displayMessageLeftAlign("SHT40 initialized");
+}
 
-  // Initialize SD card
+unsigned int initializeSHT40() {
+    if (!sht4.begin()) {
+    return 1;
+  }
+  return 0;
+}
+
+unsigned int initializeSDCard() {
   pinMode(5, OUTPUT);
   digitalWrite(5, HIGH);
   while (!SD.begin(SDCARD_SS_PIN,SDCARD_SPI,4000000UL)) {
-    displayMessageLeftAlign("Card Mount Failed");
-    return;
+    return 1;
   }
-  displayMessageLeftAlign("SD card initialized");
+  return 0;
+}
 
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    displayMessageLeftAlign("Connecting to Wi-Fi...");
-  }
-  displayMessageLeftAlign("Connected to Wi-Fi");
-  IPAddress ip = WiFi.localIP();
-  String ipStr = String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
-  displayMessageLeftAlign(("IP Address: " + ipStr).c_str());
-
-  // Initialize the RTC
-  deviceTime = getNTPtime();
-  
+unsigned int initializeRTC() {
+  deviceTime = getNTPtime();  
   if (deviceTime == 0) {
-    displayMessageLeftAlign("Failed to get the time from NTP server");
+    return 1; // failed to get time from NTP
   }
   
   if (!rtc.begin()) {
-    displayMessageLeftAlign("Error: Couldn't find RTC");
-    while (1) delay(10);
+    return 2; // Could not find the RTC
   }
-
-  rtc.adjust(DateTime(deviceTime));
-
-  // if (rtc.lostPower()) {
-  //   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  //   rtc.start();
-  // } 
-  displayMessageLeftAlign("RTC initialized");
-
-  // Initialize file DateTime
-  lastLog = rtc.now();  
-
-  // Set up web server
-  server.on("/", []() {
-    float temperature, humidity;
-    sensors_event_t temp, hum;
-    sht4.getEvent(&temp, &hum);
-    temperature = temp.temperature;
-    humidity = hum.relative_humidity;
-
-    String page = "<h1>Temperature & Humidity</h1>";
-    page += "<p>At " + toPageDate(rtc.now()) + "</p>"; 
-    page += "<p>Temperature: " + String(temperature, 2) + " C</p>";
-    page += "<p>Humidity: " + String(humidity, 2) + "%</p>";
-    server.send(200, "text/html", page);
-  });
-
-  server.begin();
-  displayMessageLeftAlign("Web server started");
-  displayMessageLeftAlign(("View page at http://" + ipStr + "/").c_str());
-  delay(FIVE_SECONDS);
-}
-
-void loop() {
-  // Read data from sensor
-  sensors_event_t temp, hum;
-  sht4.getEvent(&temp, &hum);
-  DateTime eventStamp = rtc.now();
-  float temperature = temp.temperature;
-  float humidity = hum.relative_humidity;
-
-  // Log data to SD card
-  String fileName = getFileName();
-  bool isNewFile = SD.exists(fileName);
-  File dataFile = SD.open(getFileName(), FILE_WRITE);
-  if (dataFile) {
-    if (isNewFile) {
-      dataFile.println("timestamp,temperature,humidity");
-    }
-    dataFile.println(toLogDate(eventStamp) + "," + String(temperature) + "," + String(humidity));
-    dataFile.close();
-  } else {
-    Serial.println("Error: Failed to open file for writing");
-  }
-
-  // TODO: see if this can be removed to eliminate flicker
-  tft.fillScreen(TFT_BLACK); // Clear the screen
-  tft.setTextSize(2);
-  tft.drawString("Temperature: " + String(temperature, 2) + " C", 10, 20);
-  tft.drawString("Humidity:    " + String(humidity, 2) + " %", 10, 50);
-
-
-  // Handle client requests
-  server.handleClient();
-
-  delay(FIVE_SECONDS);
+    rtc.adjust(DateTime(deviceTime));
+  return 0;
 }
 
 unsigned long getNTPtime() {
@@ -303,3 +263,91 @@ unsigned long sendNTPpacket(const char* address) {
     udp.write(packetBuffer, NTP_PACKET_SIZE);
     udp.endPacket();
 }
+
+/****************************************/
+/*                setup()               */
+/****************************************/
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize the screen
+  initializeScreen();  
+  displayMessageLeftAlign("Initializing...");
+
+  // Initialize I2C and SHT40
+  if (initializeSHT40() == 0) {
+    displayMessageLeftAlign("SHT40 initialized");
+  } else {
+    fail("Error: SHT40 not found");
+  }
+
+  if (initializeSDCard() == 0) {
+    displayMessageLeftAlign("SD card initialized");
+  } else {
+    fail("Error: Card Mount Failed");
+  }
+
+  // Initialize the RTC
+  unsigned int rtcSuccess = initializeRTC();
+  if (rtcSuccess == 0) {
+    displayMessageLeftAlign("RTC initialized");
+  } else {
+    if (rtcSuccess == 1) {
+      fail("Error: Failed to get the time from NTP server");
+    } else {
+      fail("Error: Couldn't find RTC");
+    }
+  }
+
+  // Initialize file DateTime
+  lastLog = rtc.now();  
+
+  displayMessageLeftAlign("Initialization Complete");
+  delay(FIVE_SECONDS);
+}
+
+/****************************************/
+/*        Application Functions         */
+/****************************************/
+
+unsigned int logSample(float temperature, float humidity) {
+  String fileName = getFileName();
+  bool isNewFile = SD.exists(fileName);
+  File dataFile = SD.open(getFileName(), FILE_WRITE);
+  if (dataFile) {
+    if (isNewFile) {
+      // add a header row
+      dataFile.println("timestamp,temperature,humidity");
+    }
+    dataFile.println(toLogDate(eventStamp) + "," + String(temperature) + "," + String(humidity));
+    dataFile.close();
+  } else {
+    return 1;
+  }
+  return 0;
+}
+
+
+/****************************************/
+/*                loop()                */
+/****************************************/
+void loop() {
+  // Read data from sensor
+  sensors_event_t temp, hum;
+  sht4.getEvent(&temp, &hum);
+  eventStamp = rtc.now();
+  float temperature = temp.temperature;
+  float humidity = hum.relative_humidity;
+
+  // Log data to SD card
+  if (logSample(temperature, humidity) != 0) {
+    Serial.println("Error: Failed to write t: " + String(temperature) + " h: " + String(humidity) + " to SD Card");
+  }
+  displayData(temperature, humidity);
+
+  delay(FIVE_SECONDS);
+}
+
+
+
+
