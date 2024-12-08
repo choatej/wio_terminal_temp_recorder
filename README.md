@@ -18,5 +18,4 @@ and humidity of the ambient environment.
 - Switch between readout and graphs using terminal buttons
 - Run in monitoring mode with deep sleep and infrequent sampling
 - Read config from SD card
-- Display graphs on web page
 - Switch display units through front button press
