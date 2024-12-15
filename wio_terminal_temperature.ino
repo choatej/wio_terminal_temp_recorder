@@ -2,6 +2,7 @@
 #include <Adafruit_SHT4x.h>
 #include <RTC_SAMD51.h>
 #include <Seeed_Arduino_FS.h>
+#include"seeed_line_chart.h"
 #include "DateTime.h"
 #include <WiFi.h>
 #include <TFT_eSPI.h> 
@@ -11,14 +12,16 @@
 #define SDCARD_SPI SPI
 #endif
 
+#define maxGraphSize 50
+
 // Generally Useful
 const unsigned int FIVE_SECONDS = 5000;
 
 /*****************************************/
 /* Replace with your network credentials */
 /*****************************************/
-const char* ssid = "";
-const char* password = "";
+const char* ssid = "WiFi_69_420";
+const char* password = "TheBrightSideOfLife";
 
 
 /****************************************/
@@ -53,6 +56,9 @@ Adafruit_SHT4x sht4;
 
 // TFT Screen instance
 TFT_eSPI tft = TFT_eSPI();
+doubles graphData;
+TFT_eSprite spr = TFT_eSprite(&tft)
+
 
 
 /****************************************/ 
@@ -64,6 +70,12 @@ DateTime eventStamp;
 
 // timestamp for for log file names
 DateTime lastLog;
+
+// see if lastLog has been assigned
+bool hasLastLog = false;
+
+// use if we can't get dates
+int fileCount = 0;
 
 // convenience for tracking the next line of text on the tft
 int line_y = 0;
@@ -106,21 +118,25 @@ void displayData(float temperature, float humidity) {
 }
 
 String getFileName() {
-    // Initialize the log file name
-  DateTime now = rtc.now();
-  uint32_t diffSeconds = abs(now.unixtime() - lastLog.unixtime());
-  // Convert seconds to hours and compare
-  if (diffSeconds > 3600) {
-    now = lastLog;
+  if (hasLastLog) {
+      // Initialize the log file name
+    DateTime now = rtc.now();
+    uint32_t diffSeconds = abs(now.unixtime() - lastLog.unixtime());
+    // Convert seconds to hours and compare
+    if (diffSeconds > 3600) {
+      now = lastLog;
+    } else {
+      lastLog = now;
+    }
+    // Format timestamp as YYYY-MM-DD_HH-MM-SS
+    char timestamp[20];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d_%02d-%02d-%02d",
+            now.year(), now.month(), now.day(),
+            now.hour(), now.minute(), now.second()); 
+    return String("temps_") + timestamp + ".csv";
   } else {
-    lastLog = now;
+    return String("temps_") + fileCount++ + ".csv";
   }
-  // Format timestamp as YYYY-MM-DD_HH-MM-SS
-  char timestamp[20];
-  snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d_%02d-%02d-%02d",
-           now.year(), now.month(), now.day(),
-           now.hour(), now.minute(), now.second()); 
-  return String("temps_") + timestamp + ".csv";
 }
 
 String toLogDate(DateTime dt) {
@@ -149,6 +165,7 @@ void initializeScreen() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
+  spr.createSprite(TFT_HEIGHT,TFT_WIDTH);         
 }
 
 unsigned int initializeSHT40() {
@@ -167,16 +184,46 @@ unsigned int initializeSDCard() {
   return 0;
 }
 
+int initializeWiFi() {
+  if (ssid == "" or password == "") {
+    // no WiFi config set
+    displayMessageLeftAlign("WARNING: No WiFi configuration provided");
+    return 1;
+  }
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    displayMessageLeftAlign("Connecting to Wi-Fi...");
+  }
+  displayMessageLeftAlign("Connected to Wi-Fi");
+  IPAddress ip = WiFi.localIP();
+  String ipStr = String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
+  displayMessageLeftAlign(("IP Address: " + ipStr).c_str());
+  return 0;
+}
+
 unsigned int initializeRTC() {
-  deviceTime = getNTPtime();  
-  if (deviceTime == 0) {
-    return 1; // failed to get time from NTP
-  }
-  
-  if (!rtc.begin()) {
-    return 2; // Could not find the RTC
-  }
-    rtc.adjust(DateTime(deviceTime));
+  // access the clock
+  if (rtc.begin()) {
+    DateTime now = rtc.now();
+    if (now.year() > 2000) {
+      // rtc is set
+      return 0;
+    } else {
+      // try to get the time from ntp
+      deviceTime = getNTPtime();
+      if (deviceTime == 0) {
+        return 1; // failed to get time from NTP
+      } else {
+        rtc.adjust(DateTime(deviceTime));
+      }
+    }
+  } else {
+    // can't even find the clock, big oof
+    Serial.println("RTC not found");
+    return 2;
+  }  
   return 0;
 }
 
@@ -287,20 +334,28 @@ void setup() {
     fail("Error: Card Mount Failed");
   }
 
+  // Initialize WiFi
+  int wifiSuccess = initializeWiFi();
+  if (wifiSuccess != 0) {
+    displayMessageLeftAlign("WARNING: log files will be ordered but not timestamped");
+  }
+
   // Initialize the RTC
   unsigned int rtcSuccess = initializeRTC();
   if (rtcSuccess == 0) {
     displayMessageLeftAlign("RTC initialized");
+    // Initialize file DateTime
+    lastLog = rtc.now();  
+    hasLastLog = true;
   } else {
     if (rtcSuccess == 1) {
-      fail("Error: Failed to get the time from NTP server");
+      displayMessageLeftAlign("WARNING: Failed to get the time from NTP server, RTC clock is not set");
     } else {
-      fail("Error: Couldn't find RTC");
+      displayMessageLeftAlign("WARNING: Couldn't find RTC");
     }
   }
 
-  // Initialize file DateTime
-  lastLog = rtc.now();  
+
 
   displayMessageLeftAlign("Initialization Complete");
   delay(FIVE_SECONDS);
@@ -319,7 +374,11 @@ unsigned int logSample(float temperature, float humidity) {
       // add a header row
       dataFile.println("timestamp,temperature,humidity");
     }
-    dataFile.println(toLogDate(eventStamp) + "," + String(temperature) + "," + String(humidity));
+    String tsString = "";
+    if (hasLastLog) {
+      tsString = toLogDate(eventStamp);
+    }
+    dataFile.println(tsString + "," + String(temperature) + "," + String(humidity));
     dataFile.close();
   } else {
     return 1;
@@ -328,6 +387,31 @@ unsigned int logSample(float temperature, float humidity) {
 }
 
 
+void graphPage() {
+  spr.fillSprite(TFT_WHITE);
+  if (data.size() == max_size) {
+      data.pop();
+  }
+  auto header =  text(0, 0)
+              .value("test")
+              .align(center)
+              .valign(vcenter)
+              .width(tft.width())
+              .thickness(3);
+  header.height(header.font_height() * 2); 
+  header.draw();  
+  auto content = line_chart(20, header.height());
+  content
+        .height(tft.height() - header.height() * 1.5)
+        .width(tft.width() - content.x() * 2)
+        .based_on(0.0)
+        .show_circle(false)
+        .value(data)
+        .color(TFT_PURPLE)
+        .draw();
+    spr.pushSprite(0, 0);
+}
+
 /****************************************/
 /*                loop()                */
 /****************************************/
@@ -335,7 +419,9 @@ void loop() {
   // Read data from sensor
   sensors_event_t temp, hum;
   sht4.getEvent(&temp, &hum);
+  if (hasLastLog) {
   eventStamp = rtc.now();
+  } 
   float temperature = temp.temperature;
   float humidity = hum.relative_humidity;
 
